@@ -3,6 +3,8 @@ import random
 import math
 import time
 import tkinter as tk
+from tkinter import font as tkfont
+from pathlib import Path
 
 WIDTH, HEIGHT, CELL = 10, 20, 44
 SHAPES = {
@@ -109,12 +111,36 @@ def mix(color, target, amount):
     return '#' + ''.join(f'{round(x + (y - x) * amount):02x}' for x, y in zip(a, b))
 
 
+def resize_rgb(data, source_width, source_height, width, height):
+    """Scale a cached RGB raster without adding a third-party dependency."""
+    stride = source_width * 3
+    columns = [min(source_width-1, x*source_width//width)*3 for x in range(width)]
+    rows = []
+    cached_y, cached_row = -1, b''
+    for y in range(height):
+        sy = min(source_height-1, y*source_height//height)
+        if sy != cached_y:
+            row = data[sy*stride:(sy+1)*stride]
+            cached_row = b''.join(row[x:x+3] for x in columns)
+            cached_y = sy
+        rows.append(cached_row)
+    return b''.join(rows)
+
+
 class App:
     """A resizable, dependency-free cosmic arcade rendered on a Tk canvas."""
 
     def __init__(self, root):
         self.root, self.game = root, Game()
         self.best = 0
+        families = {f.casefold(): f for f in tkfont.families(root)}
+        self.font = next((families[f.casefold()] for f in ('Segoe UI', 'DejaVu Sans', 'Arial', 'Helvetica') if f.casefold() in families), 'Helvetica')
+        # Load the bundled artwork once. An explicit format also works on Tk 9.
+        source = tk.PhotoImage(master=root, file=str(Path(__file__).resolve().parent / 'assets' / 'nebula.png'), format='png')
+        self.texture_width, self.texture_height = source.width(), source.height()
+        ppm = source.tk.call(str(source), 'data', '-format', 'ppm')
+        self.texture = ppm.split(b'\n', 3)[3]
+        self.block_images = {}
         self.scale = 1.0
         self.particles = []
         self.notice = ''
@@ -124,10 +150,7 @@ class App:
         self.hover = None
         self.space_time = 0.0
         self.rng = random.Random(7401)
-        self.stars = [(self.rng.uniform(0, SCENE_W), self.rng.uniform(0, SCENE_H),
-                       self.rng.choice((0.6, 0.7, 1, 1.4, 2)), self.rng.random())
-                      for _ in range(260)]
-        root.title('PRISM · Cosmic Tetris')
+        root.title('Tffere Cosmic Tetris')
         root.configure(bg='#050817')
         fit = min(1, (root.winfo_screenheight() - 100) / SCENE_H,
                   (root.winfo_screenwidth() - 80) / SCENE_W)
@@ -156,54 +179,26 @@ class App:
         self.ox = (w - SCENE_W * self.scale) / 2
         self.oy = (h - SCENE_H * self.scale) / 2
         self.canvas.delete('all')
-        # A deterministic, low-resolution nebula is generated with the standard
-        # library, then enlarged by Tk. No asset downloads or image libraries.
-        iw, ih = max(1, math.ceil(w / 2)), max(1, math.ceil(h / 2))
-        image = tk.PhotoImage(width=iw, height=ih)
-        rows = []
-        for py in range(ih):
-            y = (py * 2 - self.oy) / self.scale
-            row = []
-            for px in range(iw):
-                x = (px * 2 - self.ox) / self.scale
-                wave = x - (435 + 95 * math.sin(y / 125) + 40 * math.sin(y / 49))
-                cloud = math.exp(-(wave / 110) ** 2)
-                texture = (math.sin(x / 23 + math.sin(y / 31)) *
-                           math.sin(y / 37 + x / 58) + 1) / 2
-                violet = cloud * (0.3 + 0.7 * texture)
-                blue = math.exp(-((x - 620) / 180) ** 2 - ((y - 270) / 210) ** 2)
-                # Keep the playfield readable while retaining a visible galaxy.
-                inside = BOARD_X <= x <= BOARD_X + WIDTH * CELL and BOARD_Y <= y <= BOARD_Y + HEIGHT * CELL
-                shade = 0.75 if inside else 1
-                r = int(5 + 55 * violet * shade)
-                g = int(8 + 16 * violet * shade + 14 * blue)
-                b = int(20 + 95 * violet * shade + 38 * blue)
-                row.append(f'#{r:02x}{g:02x}{b:02x}')
-            rows.append('{' + ' '.join(row) + '}')
-        image.put(' '.join(rows))
-        self.background = image.zoom(2)
+        # Resize only on window changes; animation reuses the same image.
+        sw, sh = max(1, round(SCENE_W*self.scale)), max(1, round(SCENE_H*self.scale))
+        raster = resize_rgb(self.texture, self.texture_width, self.texture_height, sw, sh)
+        self.background = tk.PhotoImage(master=self.root,
+            data=f'P6\n{sw} {sh}\n255\n'.encode()+raster, format='ppm')
+        self.make_blocks()
         c = self.canvas
-        c.create_image(0, 0, image=self.background, anchor='nw', tags='background')
-        for x, y, radius, brightness in self.stars:
-            color = mix('#3d487d', '#d9eaff', brightness)
-            c.create_oval(x-radius, y-radius, x+radius, y+radius,
-                          fill=color, outline='', tags='scene')
-            if radius == 2:
-                c.create_line(x-5, y, x+5, y, fill='#7289b2', tags='scene')
-                c.create_line(x, y-5, x, y+5, fill='#7289b2', tags='scene')
-        # A crescent planet and an orbit live INSIDE the playable area.
-        c.create_oval(598, 163, 670, 235, fill='#654eac', outline='#a28bdd', tags='scene')
-        c.create_oval(606, 160, 674, 228, fill='#10152f', outline='', tags='scene')
+        c.create_image(self.ox, self.oy, image=self.background, anchor='nw', tags='background')
+        # The asset already contains fine stars, a nebula and a crescent moon.
+        # A restrained orbital path remains visible behind the grid.
         c.create_arc(335, 140, 900, 500, start=90, extent=105,
-                     style='arc', outline='#3c3c76', tags='scene')
+                     style='arc', outline='#514b8a', tags='scene')
         x, y, bw, bh = BOARD_X, BOARD_Y, WIDTH * CELL, HEIGHT * CELL
-        for inset, color in ((-10, '#111b35'), (-7, '#2e4665'), (-4, '#0b2038'), (-2, '#54dcf5')):
+        for inset, color in ((-8, '#121934'), (-6, '#193759'), (-4, '#3377a4'), (-2, '#5eefff'), (-1, '#c4fcff')):
             c.create_rectangle(x+inset, y+inset, x+bw-inset, y+bh-inset,
                                outline=color, width=2, tags='scene')
         for col in range(WIDTH + 1):
-            c.create_line(x+col*CELL, y, x+col*CELL, y+bh, fill='#23314b', tags='scene')
+            c.create_line(x+col*CELL, y, x+col*CELL, y+bh, fill='#30365b', tags='scene')
         for row in range(HEIGHT + 1):
-            c.create_line(x, y+row*CELL, x+bw, y+row*CELL, fill='#23314b', tags='scene')
+            c.create_line(x, y+row*CELL, x+bw, y+row*CELL, fill='#30365b', tags='scene')
         c.scale('scene', 0, 0, self.scale, self.scale)
         c.move('scene', self.ox, self.oy)
         self.draw()
@@ -212,31 +207,82 @@ class App:
         return self.canvas.create_rectangle(x, y, x+w, y+h, fill=fill,
                                             outline=outline, width=width, tags='dynamic')
 
-    def text(self, x, y, text, size=12, color='#e8f3ff', bold=False, anchor='nw'):
-        return self.canvas.create_text(x, y, text=text, fill=color, anchor=anchor,
-            font=('Helvetica', max(7, round(size * self.scale)), 'bold' if bold else 'normal'),
+    def text(self, x, y, text, size=12, color='#e8f3ff', bold=False, anchor='nw', italic=False, glow=False):
+        options = dict(anchor=anchor,
+            font=(self.font, max(7, round(size*self.scale)),
+                  ('bold' if bold else 'normal')+(' italic' if italic else '')),
             tags='dynamic')
+        if glow:
+            for dx, dy in ((-1,0),(1,0),(0,-1),(0,1)):
+                self.canvas.create_text(x+dx,y+dy,text=text,fill='#234d69',**options)
+        return self.canvas.create_text(x,y,text=text,fill=color,**options)
+
+    def rounded(self, x, y, w, h, radius, fill, outline='', width=1):
+        r = min(radius, w/2, h/2)
+        points = (x+r,y, x+w-r,y, x+w,y, x+w,y+r,
+                  x+w,y+h-r, x+w,y+h, x+w-r,y+h,
+                  x+r,y+h, x,y+h, x,y+h-r, x,y+r, x,y)
+        return self.canvas.create_polygon(points, smooth=True, splinesteps=16,
+            fill=fill, outline=outline, width=width, tags='dynamic')
 
     def panel(self, x, y, w, h):
-        self.rect(x+3, y+5, w, h, '#030613')
-        self.rect(x, y, w, h, '#0a1328', '#304e70')
-        self.rect(x+1, y+1, w-2, 2, '#52658b')
+        self.rounded(x-2,y-2,w+4,h+4,13,'','#122943',2)
+        self.rounded(x,y,w,h,12,'#071125','#68bfd4')
+        # A clipped vertical gradient gives the cards a glass-like depth.
+        for py in range(2, int(h)-1, 3):
+            inset = 1
+            if py < 12:
+                inset += 12-math.sqrt(max(0,144-(12-py)**2))
+            elif py > h-12:
+                inset += 12-math.sqrt(max(0,144-(py-(h-12))**2))
+            self.rect(x+inset,y+py,w-2*inset,min(3,h-py-1),
+                      mix('#12243e','#060c1c',py/h))
+
+    def heading(self, y, title, x=28, width=230):
+        self.text(x+width/2,y,title,10,'#d2e8f4',True,'center')
+
+    def logo(self):
+        c = self.canvas
+        # Rainbow comet, drawn as vectors so the branding stays sharp on resize.
+        for n,color in enumerate(('#45e9ff','#588aff','#975dff','#d671ff','#ffe08d')):
+            c.create_polygon(49+n*14,38, 172,15, 66+n*12,41,
+                             fill=color, outline='', tags='dynamic')
+        c.create_line(172,5,172,27,fill='#d7faff',tags='dynamic')
+        c.create_line(161,16,183,16,fill='#d7faff',tags='dynamic')
+        self.text(25,47,'TFFERE',31,'#d4faff',True,italic=True,glow=True)
+        self.text(143,110,'C O S M I C  T E T R I S',9,'#e4d9ff',True,'center',italic=True)
+
+    def make_blocks(self):
+        """Cache glossy sprites once per resize, rather than redraw every bevel."""
+        self.block_images = {}
+        size = max(1, round((CELL-4)*self.scale))
+        for color in COLORS.values():
+            image = tk.PhotoImage(master=self.root,width=size,height=size)
+            rows = []
+            for py in range(size):
+                row = []
+                y = py*(CELL-4)/size
+                for px in range(size):
+                    x = px*(CELL-4)/size
+                    distances = (y,x,CELL-5-x,CELL-5-y)
+                    edge = min(distances)
+                    if edge < 6:
+                        side = distances.index(edge)
+                        target,amount = (('#ffffff',.57),('#ffffff',.25),
+                                         ('#060919',.4),('#060919',.58))[side]
+                        if y < 1:
+                            target,amount = '#ffffff',.85
+                    else:
+                        target,amount = '#ffffff', .17*(1-y/(CELL-4))
+                    row.append(mix(color,target,amount))
+                rows.append('{'+' '.join(row)+'}')
+            image.put(' '.join(rows))
+            self.block_images[color] = image
 
     def block(self, x, y, color):
-        c, n = self.canvas, CELL
-        x, y, n = x+2, y+2, n-4
-        bevel = 5
-        self.rect(x+2, y+3, n, n, '#030713')
-        self.rect(x, y, n, n, color)
-        c.create_polygon(x,y, x+n,y, x+n-bevel,y+bevel, x+bevel,y+bevel,
-                         fill=mix(color, '#ffffff', .55), outline='', tags='dynamic')
-        c.create_polygon(x,y, x+bevel,y+bevel, x+bevel,y+n-bevel, x,y+n,
-                         fill=mix(color, '#ffffff', .23), outline='', tags='dynamic')
-        c.create_polygon(x+n,y, x+n,y+n, x+n-bevel,y+n-bevel, x+n-bevel,y+bevel,
-                         fill=mix(color, '#05091b', .42), outline='', tags='dynamic')
-        c.create_polygon(x,y+n, x+bevel,y+n-bevel, x+n-bevel,y+n-bevel, x+n,y+n,
-                         fill=mix(color, '#05091b', .6), outline='', tags='dynamic')
-        self.rect(x+bevel, y+bevel, n-2*bevel, n-2*bevel, '', mix(color, '#ffffff', .12))
+        self.rect(x+4,y+5,CELL-4,CELL-4,'#030713')
+        self.canvas.create_image(x+2,y+2,image=self.block_images[color],
+                                 anchor='nw',tags=('dynamic','block'))
 
     def draw(self):
         if not hasattr(self, 'background') or self.closed:
@@ -244,33 +290,36 @@ class App:
         c, g = self.canvas, self.game
         c.delete('dynamic')
         self.draw_space()
-        self.text(28, 49, 'P R I S M', 28, '#eafaff', True)
-        self.text(30, 94, 'C O S M I C   T E T R I S', 9, '#83cbdf')
-        c.create_line(30, 122, 253, 122, fill='#3b7394', tags='dynamic')
-        self.panel(28, 156, 230, 128)
-        self.text(45, 173, 'C U R R E N T   R U N', 9, '#90a7c5')
-        self.text(43, 200, f'{g.score:06d}', 31, '#cefbff', True)
-        self.text(46, 252, 'P O I N T S', 9, '#46dfed')
-        for x, label, value in ((28, 'LEVEL', f'{g.level:02d}'), (151, 'LINES', f'{g.lines:03d}')):
-            self.panel(x, 305, 107, 110)
-            self.text(x+16, 322, label, 10, '#90a7c5')
-            self.text(x+15, 350, value, 27, '#e0faff', True)
-        self.panel(28, 437, 230, 104)
-        self.text(45, 454, 'NEXT LEVEL', 10, '#90a7c5')
-        self.rect(45, 484, 195, 10, '#192540')
-        if g.lines % 10:
-            self.rect(45, 484, 195*(g.lines % 10)/10, 10, '#35d4e9')
-        self.text(45, 507, f'{10-g.lines % 10} lines to level {g.level+1}', 10, '#7089ab')
-        self.panel(28, 563, 230, 105)
-        self.text(45, 581, 'SESSION BEST', 10, '#90a7c5')
-        self.text(43, 609, f'{self.best:06d}', 24, '#d8d3ff', True)
-        for name, y, caption in (('pause', 723, 'RESUME' if g.paused else 'PAUSE'),
-                                  ('restart', 787, 'RESTART')):
-            self.rect(28, y, 230, 47, '#142d46' if self.hover == name else '#0b1a30',
-                      '#6ceaf1' if self.hover == name else '#3d7594')
-            self.text(143, y+23, caption, 12, '#d4f7ff', True, 'center')
-        self.text(30, 883, 'F I N D   Y O U R   O R B I T .', 9, '#9ca9ce')
-        self.text(30, 907, 'PYTHON / TKINTER', 8, '#536684')
+        self.logo()
+        self.panel(28,156,230,128)
+        self.heading(180,'C U R R E N T   R U N')
+        self.text(143,228,f'{g.score:06d}',30,'#b8f8ff',True,'center',glow=True)
+        for x,label,value in ((28,'LEVEL',f'{g.level:02d}'),(151,'LINES',f'{g.lines:03d}')):
+            self.panel(x,305,107,110)
+            self.heading(329,label,x,107)
+            self.text(x+53.5,375,value,29,'#bbf6ff',True,'center',glow=True)
+        self.panel(28,437,230,104)
+        self.heading(461,'N E X T   L E V E L')
+        self.rounded(45,486,195,22,11,'#050e20','#82c8da')
+        progress = (g.lines % 10)/10
+        if progress:
+            self.rounded(49,490,max(12,187*progress),14,7,'#0de4ef','#76f8ff')
+        self.panel(28,563,230,105)
+        self.heading(587,'S E S S I O N   B E S T')
+        self.text(143,631,f'{self.best:06d}',27,'#c6f5ff',True,'center',glow=True)
+        for name,y,caption in (('pause',723,'RESUME' if g.paused else 'PAUSE'),('restart',787,'RESTART')):
+            self.panel(40,y,206,47)
+            if self.hover == name:
+                self.rounded(40,y,206,47,12,'','#8cf8ff',2)
+            if name == 'pause':
+                for dx in (0,7):
+                    self.rect(69+dx,y+16,3,15,'#c9faff')
+            else:
+                c.create_arc(65,y+13,85,y+34,start=40,extent=285,style='arc',
+                             outline='#c9faff',width=2,tags='dynamic')
+                c.create_polygon(84,y+12,84,y+21,77,y+17,fill='#c9faff',outline='',tags='dynamic')
+            self.text(158,y+23,caption,12,'#d4f7ff',True,'center')
+        self.text(143,908,'F I N D  Y O U R  O R B I T .',8,'#ddd7fa',True,'center',italic=True)
         for row, cells in enumerate(g.board):
             for col, kind in enumerate(cells):
                 if kind:
@@ -307,28 +356,28 @@ class App:
                 q = phase/1.6
                 x = BOARD_X+60+q*300
                 y = BOARD_Y+y0+q*130
-                c.create_line(x-42, y-18, x, y, fill='#31486a', width=2, tags='dynamic')
-                c.create_line(x-18, y-8, x, y, fill='#7ba8bd', tags='dynamic')
-                self.rect(x-1, y-1, 3, 3, '#b6d7e1')
+                c.create_line(x-42, y-18, x, y, fill='#574184', width=2, tags='dynamic')
+                c.create_line(x-18, y-8, x, y, fill='#c5b8ff', tags='dynamic')
+                self.rect(x-1, y-1, 3, 3, '#f3eaff')
         # A distant saucer travels slowly across the upper half of the board.
         x = BOARD_X+35+(t*13) % (WIDTH*CELL-70)
         y = BOARD_Y+290+24*math.sin(t*.45)
         c.create_oval(x-5, y-7, x+5, y+3, fill='#334064', outline='#53668b', tags='dynamic')
-        c.create_oval(x-15, y-1, x+15, y+6, fill='#263b5b', outline='#547a94', tags='dynamic')
+        c.create_oval(x-15, y-1, x+15, y+6, fill='#30496d', outline='#b9b3ec', tags='dynamic')
         for dx in (-8, 0, 8):
             self.rect(x+dx-1, y+3, 2, 1, '#88a7bb')
         # A tiny rocket ascends well inside the right edge, behind the pieces.
         x = BOARD_X+WIDTH*CELL-55+8*math.sin(t*.4)
         y = BOARD_Y+HEIGHT*CELL-45-(t*23) % (HEIGHT*CELL-100)
         c.create_polygon(x,y-12, x-5,y-3, x-5,y+9, x+5,y+9, x+5,y-3,
-                         fill='#465675', outline='#7382a0', tags='dynamic')
+                         fill='#b9c8df', outline='#d8f5ff', tags='dynamic')
         c.create_polygon(x-5,y+3, x-10,y+12, x-4,y+9,
-                         fill='#536383', outline='', tags='dynamic')
+                         fill='#5b8dbe', outline='', tags='dynamic')
         c.create_polygon(x+5,y+3, x+10,y+12, x+4,y+9,
-                         fill='#536383', outline='', tags='dynamic')
-        c.create_oval(x-2,y-2,x+2,y+2, fill='#89bac7', outline='', tags='dynamic')
+                         fill='#5b8dbe', outline='', tags='dynamic')
+        c.create_oval(x-2,y-2,x+2,y+2, fill='#32f0ff', outline='', tags='dynamic')
         c.create_polygon(x-3,y+10, x,y+19+3*math.sin(t*16), x+3,y+10,
-                         fill='#ba8376', outline='', tags='dynamic')
+                         fill='#bf6dff', outline='', tags='dynamic')
 
     def effects(self, old_board, old_lines):
         g = self.game
@@ -381,7 +430,7 @@ class App:
         if not hasattr(self, 'ox'):
             return None
         x, y = (event.x-self.ox)/self.scale, (event.y-self.oy)/self.scale
-        if 28 <= x <= 258:
+        if 40 <= x <= 246:
             if 723 <= y <= 770:
                 return 'pause'
             if 787 <= y <= 834:
